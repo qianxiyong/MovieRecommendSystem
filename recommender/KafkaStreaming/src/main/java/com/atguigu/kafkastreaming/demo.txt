@@ -1,0 +1,51 @@
+package com.atguigu.kafkastreaming;/**
+ * Copyright (c) 2018-2028 尚硅谷 All Rights Reserved
+ * <p>
+ * Project: MovieRecommenderSystem
+ * Package: com.atguigu.kafkastreaming
+ * Version: 1.0
+ * <p>
+ * Created by wushengran on 2019/3/19 10:58
+ */
+
+import org.apache.kafka.streams.processor.Processor;
+import org.apache.kafka.streams.processor.ProcessorContext;
+
+/**
+ * @ClassName: LogProcessor
+ * @Description:
+ * @Author: wushengran on 2019/3/19 10:58
+ * @Version: 1.0
+ */
+public class LogProcessor implements Processor<byte[], byte[]>{
+
+    private ProcessorContext context;
+
+    @Override
+    public void init(ProcessorContext processorContext) {
+        this.context = processorContext;
+    }
+
+    @Override
+    public void process(byte[] dummy, byte[] line) {
+        String input = new String(line);
+
+        // 对input信息进行过滤处理，所有评分数据前面会加上MOVIE_RATING_PREFIX:前缀
+        if(input.contains("MOVIE_RATING_PREFIX:")){
+            System.out.println("movie rating log info coming! ------" + input);
+            input = input.split("MOVIE_RATING_PREFIX:")[1].trim();
+            context.forward("logProcessor".getBytes(), input.getBytes());
+        }
+    }
+
+    @Override
+    public void punctuate(long l) {
+
+    }
+
+    @Override
+    public void close() {
+
+    }
+}
+

@@ -1,0 +1,129 @@
+package com.atguigu.content
+
+import org.apache.spark.SparkConf
+import org.apache.spark.ml.feature.{HashingTF, IDF, Tokenizer}
+import org.apache.spark.ml.linalg.SparseVector
+import org.apache.spark.sql.SparkSession
+import org.jblas.DoubleMatrix
+
+/**
+  * Copyright (c) 2018-2028 尚硅谷 All Rights Reserved
+  *
+  * Project: MovieRecommenderSystem
+  * Package: com.atguigu.content
+  * Version: 1.0
+  *
+  * Created by wushengran on 2019/3/19 9:09
+  */
+
+// 创建样例类
+// 基于LFM的CF推荐只需要movie和rating数据
+case class Movie(mid:Int, name: String, descri: String, timelong: String, issue: String,
+                 shoot: String, language: String, genres: String, actors: String,
+                 directors: String
+                )
+
+// 创建mongodb配置样例类
+case class MongoConfig(uri:String, db:String)
+
+// 定义一个标准推荐对象
+case class Recommendation(mid: Int, score: Double)
+
+
+// 定义一个电影相似度列表对象
+case class MovieRecs(mid: Int, recs: Seq[Recommendation])
+
+object ContentRecommmender {
+
+  // 定义表名
+  val MONGODB_MOVIE_COLLECTION = "Movie"
+
+  // 最终结果存入mongodb的表名
+  val CONTENT_MOVIE_RECS = "ContentMovieRecs"
+
+  def main(args: Array[String]): Unit = {
+    // 定义用到的配置参数
+    val config = Map(
+      "spark.cores" -> "local[*]",
+      "mongo.uri" -> "mongodb://localhost:27017/recommender",
+      "mongo.db" -> "recommender"
+    )
+
+    val sparkConf = new SparkConf().setAppName("OfflineRecommender").setMaster(config("spark.cores"))
+    val spark = SparkSession.builder().config(sparkConf).getOrCreate()
+
+    import spark.implicits._
+
+    implicit val mongoConfig = MongoConfig(config("mongo.uri"), config("mongo.db"))
+
+    // 加载电影数据，并作预处理
+    val movieTagsDF = spark.read
+      .option("uri", mongoConfig.uri)
+      .option("collection", MONGODB_MOVIE_COLLECTION)
+      .format("com.mongodb.spark.sql")
+      .load()
+      .as[Movie]
+      .map( x => (x.mid, x.name, x.genres.map(c => if(c=='|') ' ' else c)) )       // 做信息提取，需要mid，name，genres；其中类型数据本身用"|"分隔，替换成空格
+      .toDF("mid", "name", "genres").cache()
+
+    // TODO: 从电影数据中提取特征向量，TF-IDF
+
+    // 新建一个分词器，默认按照空格分隔
+    val tokenizer = new Tokenizer().setInputCol("genres").setOutputCol("words")
+    // 使用分词器对原始类别列做转换，生成一个新的dataframe
+    val wordsData = tokenizer.transform(movieTagsDF)
+
+    // HashingTF是一个工具，可以把一个词语序列转换成对应的词频
+    val hashingTF = new HashingTF().setInputCol("words").setOutputCol("rawFeatures").setNumFeatures(50)
+    val featurizedData = hashingTF.transform(wordsData)
+
+    // IDF也是一个工具，用于计算文档的IDF
+    val idf = new IDF().setInputCol("rawFeatures").setOutputCol("features")
+    // 计算idf模型，统计原始数据各关键词的idf
+    val idfModel = idf.fit(featurizedData)
+    val rescaledData = idfModel.transform(featurizedData)
+
+    //rescaledData.show(10, false)
+
+    // 把rescaledData转换成特征向量，数据格式（mid， DoubleMatrix）
+    val movieFeatures = rescaledData.map {
+      case row => ( row.getAs[Int]("mid"), row.getAs[SparseVector]("features").toArray )
+    }
+      .rdd
+      .map( x => (x._1, new DoubleMatrix(x._2)) )
+
+    //movieFeatures.collect().foreach(println)
+
+    // 电影和电影集合做笛卡尔积，所有特征向量两两配对，计算相似度
+    // (mid, features) -> (mid, features)
+    val movieRecs = movieFeatures.cartesian(movieFeatures)
+      .filter{
+        case (a, b) => a._1 != b._1  // 条件过滤，排除自己跟自己做计算
+      }
+      .map{
+        case (a, b) =>
+          val simScore = this.consinSim(a._2, b._2)    // 求a，b的余弦相似度
+          ( a._1, (b._1, simScore) )    // 构建想要得到的数据结构，方便之后根据mid做groupby
+      }
+      .filter(_._2._2>0.6)        // 过滤，只选取相似度大于0.6的写入表中
+      .groupByKey()               // 按照mid做group
+      .map{
+      case (mid, items) => MovieRecs( mid, items.toList.sortWith(_._2>_._2).map(x => Recommendation(x._1, x._2)) )
+    }
+      .toDF()
+
+    movieRecs.write
+      .option("uri", mongoConfig.uri)
+      .option("collection", CONTENT_MOVIE_RECS)
+      .mode("overwrite")
+      .format("com.mongodb.spark.sql")
+      .save()
+
+    spark.stop()
+  }
+
+  def consinSim(movie1: DoubleMatrix, movie2: DoubleMatrix):Double = {
+    movie1.dot(movie2) / ( movie1.norm2() * movie2.norm2() )
+  }
+
+}

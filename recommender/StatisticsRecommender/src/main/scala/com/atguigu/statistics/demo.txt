@@ -1,0 +1,159 @@
+package com.atguigu.statistics
+
+import java.text.SimpleDateFormat
+import java.util.Date
+
+import org.apache.spark.SparkConf
+import org.apache.spark.sql.{DataFrame, SparkSession}
+
+/**
+  * Copyright (c) 2018-2028 尚硅谷 All Rights Reserved
+  *
+  * Project: MovieRecommenderSystem
+  * Package: com.atguigu.statistics
+  * Version: 1.0
+  *
+  * Created by wushengran on 2019/3/16 10:14
+  */
+
+// 创建样例类
+// 统计推荐只需要movie和rating数据
+case class Movie(mid:Int, name: String, descri: String, timelong: String, issue: String,
+                 shoot: String, language: String, genres: String, actors: String,
+                 directors: String
+                )
+
+case class Rating(uid: Int, mid: Int, score: Double, timestamp: Int)
+
+// 创建mongodb配置样例类
+case class MongoConfig(uri:String, db:String)
+
+// 定义一个标准推荐对象
+case class Recommendation(mid: Int, score: Double)
+// 定义一个电影类别推荐对象
+case class GenresRecommendation(genres: String, recs: Seq[Recommendation])
+
+object StatisticsRecommender {
+
+  // 定义表名
+  val MONGODB_MOVIE_COLLECTION = "Movie"
+  val MONGODB_RATING_COLLECTION = "Rating"
+
+  val RATE_MORE_MOVIES = "RateMoreMovies"  // 历史热门电影表
+  val RATE_MORE_RECENTLY_MOVIES = "RateMoreRecentlyMovies"  // 近期热门电影表
+  val AVERAGE_MOVIES = "AverageMovies"    // 电影平均评分表
+  val GENRES_TOP_MOVIES = "GenresTopMovies"   // 电影类别Top10表
+
+  def main(args: Array[String]): Unit = {
+    // 定义用到的配置参数
+    val config = Map(
+      "spark.cores" -> "local[*]",
+      "mongo.uri" -> "mongodb://localhost:27017/recommender",
+      "mongo.db" -> "recommender"
+    )
+
+    // 创建sparkConf
+    val sparkConf = new SparkConf().setMaster(config("spark.cores")).setAppName("StatisticsRecommender")
+
+    // 创建spark session
+    val spark = SparkSession.builder().config(sparkConf).getOrCreate()
+
+    import spark.implicits._
+
+    // 声明一个隐式的配置对象
+    implicit val mongoConfig = MongoConfig(config("mongo.uri"),config("mongo.db"))
+
+    // 从mongodb中加载数据
+    val ratingDF = spark.read
+      .option("uri", mongoConfig.uri)
+      .option("collection", MONGODB_RATING_COLLECTION)
+      .format("com.mongodb.spark.sql")
+      .load()
+      .as[Rating]
+      .toDF()
+
+    val movieDF = spark.read
+      .option("uri", mongoConfig.uri)
+      .option("collection", MONGODB_MOVIE_COLLECTION)
+      .format("com.mongodb.spark.sql")
+      .load()
+      .as[Movie]
+      .toDF()
+
+    // 创建一张叫做ratings的临时表
+    ratingDF.createOrReplaceTempView("ratings")
+
+    // 1. 历史热门电影统计，根据评分次数统计
+    // 数据结构：mid, count
+    val rateMoreMoviesDF = spark.sql("select mid, count(mid) as count from ratings group by mid order by count DESC")
+    // 把结果写入mongodb
+    storeDFInMongoDB(rateMoreMoviesDF, RATE_MORE_MOVIES)
+
+    // 2. 近期热门电影统计，根据评分次数，加入时间考量，把时间戳转换为“yyyyMM”格式
+    // 数据结构：mid, count, time
+    // 创建一个日期格式化工具
+    val simpleDateFormat = new SimpleDateFormat("yyyyMM")
+
+    // 注册一个UDF，用于将时间戳转化为标准格式
+    spark.udf.register("changeDate", (x: Int)=> simpleDateFormat.format(new Date(x * 1000L)).toInt )
+
+    // 先对时间数据做处理，并且去掉uid，提取出的mid，score，yearmonth放在临时表里
+    val ratingOfYearMonth = spark.sql("select mid, score, changeDate(timestamp) as yearmonth from ratings")
+    ratingOfYearMonth.createOrReplaceTempView("ratingOfMonth")
+
+    // 提取出按照年月和mid分组的评分数量统计
+    val rateMoreRecentlyMoviesDF = spark.sql("select mid, count(mid) as count, yearmonth from ratingOfMonth group by yearmonth,mid order by yearmonth,count DESC")
+
+    storeDFInMongoDB(rateMoreRecentlyMoviesDF, RATE_MORE_RECENTLY_MOVIES)
+
+    // 3. 电影平均评分统计
+    // 数据结构：mid, avg
+    val averageMoviesDF = spark.sql("select mid, avg(score) as avg from ratings group by mid")
+
+    storeDFInMongoDB(averageMoviesDF, AVERAGE_MOVIES)
+
+    // 4. 电影类别TOP10统计
+    // 数据结构：GenresRecommendation
+
+    //所有的电影类别
+    val genres = List("Action","Adventure","Animation","Comedy","Crime","Documentary","Drama","Family","Fantasy","Foreign","History","Horror","Music","Mystery"
+      ,"Romance","Science","Tv","Thriller","War","Western")
+
+    // movie 和 avg 做inner连接
+    val movieWithScore = movieDF.join(averageMoviesDF, "mid")
+
+    // 利用求笛卡尔积的方式，将movie和类别一一匹配，然后再做过滤筛选，先转成rdd
+    val genresRDD = spark.sparkContext.makeRDD(genres)
+
+    // 计算类别TOP10
+    val genresTopMoviesDF = genresRDD.cartesian(movieWithScore.rdd)   // 得到genres, movierow
+      .filter{  // 用bool判断条件进行过滤
+        case (genres, row) => row.getAs[String]("genres").toLowerCase().contains(genres.toLowerCase() )
+      }
+      .map{    // 对数据集做一个简化，只需要 genres, (mid, avg)，把mid和avg包起来方便之后做聚合
+        case (genres, row) => {
+          ( genres, (row.getAs[Int]("mid"), row.getAs[Double]("avg")) )
+        }
+      }
+      .groupByKey()     // 根据类型直接聚合
+      .map{       // 转换成想要的数据结构
+        case (genres, items) =>
+          GenresRecommendation( genres, items.toList.sortWith(_._2>_._2).take(10).map( item => Recommendation(item._1, item._2) ) )
+      }
+      .toDF()
+
+    storeDFInMongoDB(genresTopMoviesDF, GENRES_TOP_MOVIES)
+
+    spark.stop()
+  }
+
+  def storeDFInMongoDB(df: DataFrame, collection_name: String)(implicit mongoConfig: MongoConfig): Unit ={
+    df.write
+      .option("uri", mongoConfig.uri)
+      .option("collection", collection_name)
+      .mode("overwrite")
+      .format("com.mongodb.spark.sql")
+      .save()
+  }
+
+}

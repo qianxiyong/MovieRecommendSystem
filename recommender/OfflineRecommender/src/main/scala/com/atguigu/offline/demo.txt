@@ -1,0 +1,90 @@
+package com.atguigu.offline
+
+import breeze.numerics.sqrt
+import com.atguigu.offline.OfflineRecommender.MONGODB_RATING_COLLECTION
+import org.apache.spark.SparkConf
+import org.apache.spark.mllib.recommendation.{ALS, MatrixFactorizationModel, Rating}
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.SparkSession
+
+/**
+  * Copyright (c) 2018-2028 尚硅谷 All Rights Reserved
+  *
+  * Project: MovieRecommenderSystem
+  * Package: com.atguigu.offline
+  * Version: 1.0
+  *
+  * Created by wushengran on 2019/3/16 15:58
+  */
+object ALSTrainer {
+
+  def main(args: Array[String]): Unit = {
+    // 定义用到的配置参数
+    val config = Map(
+      "spark.cores" -> "local[*]",
+      "mongo.uri" -> "mongodb://localhost:27017/recommender",
+      "mongo.db" -> "recommender"
+    )
+
+    val sparkConf = new SparkConf().setAppName("OfflineRecommender").setMaster(config("spark.cores"))
+    val spark = SparkSession.builder().config(sparkConf).getOrCreate()
+
+    import spark.implicits._
+
+    implicit val mongoConfig = MongoConfig(config("mongo.uri"), config("mongo.db"))
+
+    // 加载数据
+    val ratingRDD = spark.read
+      .option("uri", mongoConfig.uri)
+      .option("collection", MONGODB_RATING_COLLECTION)
+      .format("com.mongodb.spark.sql")
+      .load()
+      .as[MovieRating]
+      .rdd          // 转换成rdd，因为ALS输入数据要求是rdd
+      .map( rating => Rating(rating.uid, rating.mid, rating.score) ) // 去掉时间戳，只需要uid，mid，score
+      .cache()      // 为性能考虑，设置缓存
+
+    // 将原始数据集随机划分为两个RDD，对应训练集和测试集
+    val splits = ratingRDD.randomSplit(Array(0.8, 0.2))
+    val trainRDD = splits(0)
+    val testRDD = splits(1)
+
+    // 把trainRDD传入模型，训练模型，用testRDD计算RMSE，最终根据不同参数选取对应的RMSE，得到最优参数
+    adjustALSParams(trainRDD, testRDD)
+
+    spark.stop()
+
+  }
+
+  def adjustALSParams(trainData: RDD[Rating], testData: RDD[Rating]): Unit ={
+    // 根据不同的参数选取，迭代计算模型，分别求出当前的rmse
+    val result = for(rank <- Array(20, 30, 50, 100); lambda <- Array(0.001, 0.01, 0.1, 1))
+      yield {
+        // 用trainData来训练模型
+        val model = ALS.train(trainData, rank, 5, lambda)
+        // 用testData计算当前模型的RMSE
+        val rmse = computeRMSE(model, testData)
+        ( rank, lambda, rmse )
+      }
+    println("best parameters: " + result.minBy(_._3))
+  }
+
+  def computeRMSE(model: MatrixFactorizationModel, testData: RDD[Rating]):Double = {
+
+    // 计算预测评分
+    val userMovies = testData.map(x=>(x.user, x.product))
+    val predictRatings = model.predict(userMovies)
+
+    // 构建希望的数据结构：(uid, mid), rating
+    val real = testData.map( x=>( (x.user, x.product), x.rating ) )
+    val predict = predictRatings.map( x=> ( (x.user, x.product), x.rating )  )
+
+    // 用real和predict做inner join，得到 (uid, mid), (real, predict)
+    sqrt( real.join(predict).map{
+      case ((uid, mid), (real, pre)) =>
+        val err = real -pre
+        err * err
+      }.mean()
+    )
+  }
+}
